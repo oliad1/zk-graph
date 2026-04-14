@@ -8,7 +8,7 @@ use egui_graphs::{
 use petgraph::{
     Direction::Incoming,
     Undirected,
-    graph::{Edges, NodeIndex, UnGraph},
+    graph::{EdgeIndex, Edges, NodeIndex, UnGraph},
     prelude::StableUnGraph,
     stable_graph::StableGraph,
     visit::EdgeRef,
@@ -19,7 +19,7 @@ use std::{
     collections::{HashMap, HashSet},
     io::Read,
     process::{Command, Stdio},
-    sync::mpsc::Receiver,
+    sync::mpsc::{Receiver, Sender},
     time::Duration,
 }; //, self, Write};
 //use std::str;
@@ -29,7 +29,14 @@ use std::path::Path;
 
 pub struct BasicApp {
     g: Graph<Note, (), Undirected>,
-    rx: Receiver<DebounceEventResult>,
+    nodes: HashMap<String, NodeIndex>,
+    rx: Receiver<MessageType>,
+}
+
+#[derive(Debug)]
+pub struct MessageType {
+    msg_type: String,
+    metadata: Value,
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug)]
@@ -87,19 +94,46 @@ struct ZkGraph {
 }
 
 impl BasicApp {
-    fn new(_: &CreationContext<'_>, zk_graph: ZkGraph, rx: Receiver<DebounceEventResult>) -> Self {
-        let g = generate_graph(zk_graph);
-        Self { g, rx }
+    fn new(_: &CreationContext<'_>, rx: Receiver<MessageType>) -> Self {
+        let g: StableUnGraph<Note, ()> = StableUnGraph::default();
+        let ui_graph = to_graph(&g);
+        let nodes = HashMap::new();
+        Self {
+            g: ui_graph,
+            nodes,
+            rx,
+        }
     }
 }
 
 impl App for BasicApp {
     fn ui(&mut self, ui: &mut egui::Ui, _: &mut eframe::Frame) {
         let ctx = ui.ctx().clone();
+        /*
+        //File watcher code
         while let Ok(Ok(payload)) = self.rx.try_recv() {
             println!("File change {:?}", payload[0]);
             //self.g.add_node_with_label((), "TEST".to_string()); //= generate_graph(render_graph());
-            self.g = generate_graph(render_graph());
+            //self.g = generate_graph(render_graph());
+        }*/
+
+        while let Ok(payload) = self.rx.try_recv() {
+            println!("RECEIEVED MSG: {:?}", payload.msg_type);
+            match payload.msg_type.as_str() {
+                "INS_NODE" => {
+                    let note: Note = serde_json::from_value(payload.metadata).unwrap();
+                    let node_idx = self.g.add_node_with_label(note.clone(), note.title.clone());
+                    self.nodes.insert(note.filename.clone(), node_idx);
+                }
+                "INS_EDGE" => {
+                    let link: Link = serde_json::from_value(payload.metadata).unwrap();
+                    let source_node = self.nodes[&link.source_path];
+                    let target_node = self.nodes[&link.target_path];
+                    self.g.add_edge(source_node, target_node, ());
+                    //ui_graph.add_edge(source_node, target_node, ());
+                }
+                _ => println!("Undetermined `msg_type` value"),
+            }
         }
 
         egui::CentralPanel::default().show_inside(ui, |ui| {
@@ -107,12 +141,9 @@ impl App for BasicApp {
                 egui_graphs::LayoutForceDirected<egui_graphs::FruchtermanReingoldWithCenterGravity>;
             type S = egui_graphs::FruchtermanReingoldWithCenterGravityState;
 
-            let settings_interaction = SettingsInteraction::new()
-                .with_node_selection_enabled(true)
-                .with_edge_selection_enabled(true);
-            let settings_navigation = SettingsNavigation::new()
-                .with_zoom_and_pan_enabled(true)
-                .with_fit_to_screen_enabled(false);
+            let settings_interaction = SettingsInteraction::new().with_node_selection_enabled(true);
+            let settings_navigation = SettingsNavigation::new().with_zoom_and_pan_enabled(true);
+            //.with_fit_to_screen_enabled(false);
 
             let selected_nodes: Vec<_> = self.g.selected_nodes().iter().copied().collect();
             let all_nodes: Vec<_> = self.g.nodes_iter().map(|(idx, _)| idx).collect();
@@ -129,14 +160,16 @@ impl App for BasicApp {
                 let selected_edges = self
                     .g
                     .edges_directed(idx, Incoming)
-                    .map(|edge_ref| {
-                        println!("EDGES {}", edge_ref.id().index());
-
-                        edge_ref.id()
-                    })
+                    .map(|edge_ref| edge_ref.id())
                     .collect();
 
+                println!("Selected Edges {:?}", selected_edges);
+
                 self.g.set_selected_edges(selected_edges); //Currently does not work
+
+                let new_se = Vec::from(self.g.selected_edges());
+
+                println!("NEW SE {:?}", new_se);
 
                 let (node) = {
                     let node = self.g.node(idx).unwrap();
@@ -162,16 +195,13 @@ impl App for BasicApp {
                     });
             }
 
+            let selected_edges = Vec::from(self.g.selected_edges());
+
             let settings_style = SettingsStyle::new().with_edge_stroke_hook(
                 move |selected, order, current_stroke, egui_style| {
                     let mut new_stroke = current_stroke.clone();
 
-                    if selected {
-                        new_stroke.color = Color32::from_hex("#7852EE").unwrap();
-                    } else {
-                        new_stroke.color = Color32::DARK_GRAY;
-                    }
-
+                    new_stroke.color = Color32::DARK_GRAY;
                     new_stroke.width = 0.5;
 
                     new_stroke
@@ -181,7 +211,7 @@ impl App for BasicApp {
             let mut state: FruchtermanReingoldWithCenterGravityState =
                 egui_graphs::get_layout_state(ui, None);
 
-            state.base.c_repulse = 0.005;
+            state.base.c_repulse = 0.01;
             //state.base.c_attract = 0.9;
 
             //println!("{}", &format!("{c}", c = state.extras.0.params.c));
@@ -202,22 +232,23 @@ impl App for BasicApp {
     }
 }
 
-fn generate_graph(zk_graph: ZkGraph) -> Graph<Note, (), Undirected> {
-    let mut g: StableUnGraph<Note, ()> = StableUnGraph::default();
-    let mut ui_graph = to_graph(&g);
-
+fn generate_graph(tx: Sender<MessageType>, zk_graph: ZkGraph) {
     let mut nodes: HashMap<String, NodeIndex> = HashMap::new();
     let mut links = HashSet::new();
 
     for note in zk_graph.notes.iter() {
-        nodes.insert(note.filename.clone(), g.add_node(note.clone()));
-        ui_graph.add_node_with_label(note.clone(), note.title.clone());
-        //std::thread::sleep(std::time::Duration::from_secs(10));
+        // SEND NEW NODE MESSAGE
+        tx.send(MessageType {
+            msg_type: String::from("INS_NODE"),
+            metadata: serde_json::to_value(note).unwrap(),
+        })
+        .unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(300));
+        //nodes.insert(note.filename.clone(), g.add_node(note.clone()));
+        //ui_graph.add_node_with_label(note.clone(), note.title.clone());
     }
 
     for link in zk_graph.links.iter() {
-        let source_node = nodes[&link.source_path];
-        let target_node = nodes[&link.target_path];
         if !links.contains(&format!(
             "{target}-{source}",
             target = &link.target_path,
@@ -232,12 +263,17 @@ fn generate_graph(zk_graph: ZkGraph) -> Graph<Note, (), Undirected> {
                 target = &link.target_path,
                 source = &link.source_path
             ));
-            g.add_edge(source_node, target_node, ());
-            ui_graph.add_edge(source_node, target_node, ());
+            //SEND NEW EDGE MESSAGE
+            tx.send(MessageType {
+                msg_type: String::from("INS_EDGE"),
+                metadata: serde_json::to_value(link).unwrap(),
+            })
+            .unwrap();
+            std::thread::sleep(std::time::Duration::from_millis(300));
+            //g.add_edge(source_node, target_node, ());
+            //ui_graph.add_edge(source_node, target_node, ());
         }
     }
-
-    ui_graph
 }
 
 fn render_graph() -> ZkGraph {
@@ -273,7 +309,7 @@ fn render_graph() -> ZkGraph {
 
 fn main() {
     //Create the async channel via mspc
-    let (tx, rx) = std::sync::mpsc::channel();
+    let (tx, rx) = std::sync::mpsc::channel::<MessageType>();
 
     let notify_config = notify::Config::default().with_compare_contents(true);
 
@@ -282,17 +318,28 @@ fn main() {
         .with_notify_config(notify_config)
         .with_batch_mode(true);
 
-    let mut debouncer = new_debouncer_opt::<_, RecommendedWatcher>(debouncer_config, tx).unwrap();
+    //let mut debouncer = new_debouncer_opt::<_, RecommendedWatcher>(debouncer_config, tx).unwrap();
 
+    /*
     debouncer
         .watcher()
         .watch(Path::new(".\\touch.txt"), RecursiveMode::Recursive)
         .unwrap();
+    */
+
+    std::thread::spawn(move || {
+        let new_tx = tx.clone();
+        println!("Thread Started. Sleeping");
+        std::thread::sleep(std::time::Duration::from_secs(1));
+        println!("Thread Done Sleeping");
+        generate_graph(new_tx, render_graph());
+        println!("Thread Generated Graph");
+    });
 
     run_native(
         "",
         NativeOptions::default(),
-        Box::new(|cc| Ok(Box::new(BasicApp::new(cc, render_graph(), rx)))),
+        Box::new(|cc| Ok(Box::new(BasicApp::new(cc, rx)))),
     )
     .unwrap();
 }
