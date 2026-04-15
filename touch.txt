@@ -1,11 +1,7 @@
 PLAN:
 - Mouse interactions
   - Fix edges highlight
-- Staggered insert animation
 - Switch notify-debouncer to notify for background loading
-  - That or manually iterate through ZkResult and use a Set for nodes to deduplicate
-  - If its a write I think I need to do the Set solution anyways since I have no other way to check the links, also useful for deleted links
-- Use random placement or staggered insert to prevent all nodes showing up in one place
 - Use same egui window context for all selected nodes
 - Add max and min scrolling with egui
 - Smoother scrolling
@@ -17,5 +13,3 @@ PLAN:
   - If I scroll in to a certain threshold, all labels show
 - Fix laggy egui::Window vertical scrolling
 - Read zk from cli arg or zk config or asssume we're in the right root
-
-- Fix zk.nvim for me

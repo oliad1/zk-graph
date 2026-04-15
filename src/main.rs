@@ -24,12 +24,13 @@ use std::{
 }; //, self, Write};
 //use std::str;
 use notify::{RecommendedWatcher, RecursiveMode, event::EventKindMask};
-use notify_debouncer_mini::{Config, DebounceEventResult, new_debouncer_opt};
+use notify_debouncer_mini::{Config, DebounceEventResult, DebouncedEvent, new_debouncer_opt};
 use std::path::Path;
 
 pub struct BasicApp {
     g: Graph<Note, (), Undirected>,
     nodes: HashMap<String, NodeIndex>,
+    links: HashSet<String>,
     rx: Receiver<MessageType>,
 }
 
@@ -98,9 +99,11 @@ impl BasicApp {
         let g: StableUnGraph<Note, ()> = StableUnGraph::default();
         let ui_graph = to_graph(&g);
         let nodes = HashMap::new();
+        let links = HashSet::new();
         Self {
             g: ui_graph,
             nodes,
+            links,
             rx,
         }
     }
@@ -122,14 +125,34 @@ impl App for BasicApp {
             match payload.msg_type.as_str() {
                 "INS_NODE" => {
                     let note: Note = serde_json::from_value(payload.metadata).unwrap();
-                    let node_idx = self.g.add_node_with_label(note.clone(), note.title.clone());
-                    self.nodes.insert(note.filename.clone(), node_idx);
+                    if !self.nodes.contains_key(&note.filename) {
+                        let node_idx = self.g.add_node_with_label(note.clone(), note.title.clone());
+                        self.nodes.insert(note.filename.clone(), node_idx);
+                    } else {
+                        println!("Duplicate key found: {:?}", note.filename);
+                    }
                 }
                 "INS_EDGE" => {
                     let link: Link = serde_json::from_value(payload.metadata).unwrap();
-                    let source_node = self.nodes[&link.source_path];
-                    let target_node = self.nodes[&link.target_path];
-                    self.g.add_edge(source_node, target_node, ());
+                    if !self.links.contains(&format!(
+                        "{target}-{source}",
+                        target = &link.target_path,
+                        source = &link.source_path
+                    )) && !self.links.contains(&format!(
+                        "{source}-{target}",
+                        target = &link.target_path,
+                        source = &link.source_path
+                    )) {
+                        self.links.insert(format!(
+                            "{target}-{source}",
+                            target = &link.target_path,
+                            source = &link.source_path
+                        ));
+                        let source_node = self.nodes[&link.source_path];
+                        let target_node = self.nodes[&link.target_path];
+                        self.g.add_edge(source_node, target_node, ());
+                    }
+
                     //ui_graph.add_edge(source_node, target_node, ());
                 }
                 _ => println!("Undetermined `msg_type` value"),
@@ -163,18 +186,15 @@ impl App for BasicApp {
                     .map(|edge_ref| edge_ref.id())
                     .collect();
 
-                println!("Selected Edges {:?}", selected_edges);
+                //println!("Selected Edges {:?}", selected_edges);
 
                 self.g.set_selected_edges(selected_edges); //Currently does not work
 
                 let new_se = Vec::from(self.g.selected_edges());
 
-                println!("NEW SE {:?}", new_se);
+                //println!("NEW SE {:?}", new_se);
 
-                let (node) = {
-                    let node = self.g.node(idx).unwrap();
-                    (node)
-                };
+                let node = self.g.node(idx).unwrap();
 
                 let default_win_pos: Pos2 = Pos2 { x: 0.0, y: 0.0 };
 
@@ -233,9 +253,6 @@ impl App for BasicApp {
 }
 
 fn generate_graph(tx: Sender<MessageType>, zk_graph: ZkGraph) {
-    let mut nodes: HashMap<String, NodeIndex> = HashMap::new();
-    let mut links = HashSet::new();
-
     for note in zk_graph.notes.iter() {
         // SEND NEW NODE MESSAGE
         tx.send(MessageType {
@@ -249,30 +266,14 @@ fn generate_graph(tx: Sender<MessageType>, zk_graph: ZkGraph) {
     }
 
     for link in zk_graph.links.iter() {
-        if !links.contains(&format!(
-            "{target}-{source}",
-            target = &link.target_path,
-            source = &link.source_path
-        )) && !links.contains(&format!(
-            "{source}-{target}",
-            target = &link.target_path,
-            source = &link.source_path
-        )) {
-            links.insert(format!(
-                "{target}-{source}",
-                target = &link.target_path,
-                source = &link.source_path
-            ));
-            //SEND NEW EDGE MESSAGE
-            tx.send(MessageType {
-                msg_type: String::from("INS_EDGE"),
-                metadata: serde_json::to_value(link).unwrap(),
-            })
-            .unwrap();
-            std::thread::sleep(std::time::Duration::from_millis(300));
-            //g.add_edge(source_node, target_node, ());
-            //ui_graph.add_edge(source_node, target_node, ());
-        }
+        tx.send(MessageType {
+            msg_type: String::from("INS_EDGE"),
+            metadata: serde_json::to_value(link).unwrap(),
+        })
+        .unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(300));
+        //g.add_edge(source_node, target_node, ());
+        //ui_graph.add_edge(source_node, target_node, ());
     }
 }
 
@@ -307,9 +308,21 @@ fn render_graph() -> ZkGraph {
     result
 }
 
+fn file_watcher(
+    tx: Sender<MessageType>,
+    file_rx: &Receiver<std::result::Result<Vec<DebouncedEvent>, notify::Error>>,
+) {
+    while let Ok(Ok(payload)) = file_rx.try_recv() {
+        println!("Received File watcher msg: {:?}", payload);
+        generate_graph(tx.clone(), render_graph());
+    }
+}
+
 fn main() {
     //Create the async channel via mspc
     let (tx, rx) = std::sync::mpsc::channel::<MessageType>();
+
+    let (file_tx, file_rx) = std::sync::mpsc::channel();
 
     let notify_config = notify::Config::default().with_compare_contents(true);
 
@@ -318,14 +331,16 @@ fn main() {
         .with_notify_config(notify_config)
         .with_batch_mode(true);
 
-    //let mut debouncer = new_debouncer_opt::<_, RecommendedWatcher>(debouncer_config, tx).unwrap();
+    let mut debouncer =
+        new_debouncer_opt::<_, RecommendedWatcher>(debouncer_config, file_tx).unwrap();
 
-    /*
     debouncer
         .watcher()
-        .watch(Path::new(".\\touch.txt"), RecursiveMode::Recursive)
+        .watch(
+            Path::new("C:\\Users\\Owner\\Documents\\zk\\zk\\"),
+            RecursiveMode::Recursive,
+        )
         .unwrap();
-    */
 
     std::thread::spawn(move || {
         let new_tx = tx.clone();
@@ -334,6 +349,10 @@ fn main() {
         println!("Thread Done Sleeping");
         generate_graph(new_tx, render_graph());
         println!("Thread Generated Graph");
+        println!("Starting file watcher loop");
+        loop {
+            file_watcher(tx.clone(), &file_rx);
+        }
     });
 
     run_native(
