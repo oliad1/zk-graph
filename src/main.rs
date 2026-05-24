@@ -2,6 +2,7 @@ use eframe::{App, CreationContext, NativeOptions, run_native};
 use egui::{Color32, Pos2, RichText};
 use egui_commonmark::{CommonMarkCache, CommonMarkViewer};
 use egui_graphs::{
+    Node,
     DefaultGraphView, FruchtermanReingoldState, FruchtermanReingoldWithCenterGravityState, Graph,
     SettingsInteraction, SettingsNavigation, SettingsStyle, to_graph,
 };
@@ -26,12 +27,14 @@ use std::{
 use notify::{RecommendedWatcher, RecursiveMode, event::EventKindMask};
 use notify_debouncer_mini::{Config, DebounceEventResult, DebouncedEvent, new_debouncer_opt};
 use std::path::Path;
+use std::sync::{Arc, RwLock};
 
 pub struct BasicApp {
     g: Graph<Note, (), Undirected>,
     nodes: HashMap<String, NodeIndex>,
     links: HashSet<String>,
     rx: Receiver<MessageType>,
+    selected_node: RwLock<Option<Node<Note, (), Undirected>>>,
 }
 
 #[derive(Debug)]
@@ -100,11 +103,15 @@ impl BasicApp {
         let ui_graph = to_graph(&g);
         let nodes = HashMap::new();
         let links = HashSet::new();
+        
+        let selected_node = RwLock::new(None);
+
         Self {
             g: ui_graph,
             nodes,
             links,
             rx,
+            selected_node 
         }
     }
 }
@@ -158,6 +165,30 @@ impl App for BasicApp {
                 _ => println!("Undetermined `msg_type` value"),
             }
         }
+        
+        let node_opt = self.selected_node.read().unwrap().clone();
+         
+        egui::Panel::left("left_panel")
+            .resizable(true)
+            .show_animated_inside(
+                ui,
+                node_opt.is_some(),
+                |ui| {
+                    if let Some(node) = node_opt {
+                        egui::ScrollArea::vertical().show(ui, |ui| {
+                            ui.take_available_space();
+
+                            let payload = node.payload();
+
+                            ui.label(format!("{} | Word Count: {} | Created: {}", payload.filename.as_str(), payload.word_count, payload.created));
+
+                            CommonMarkViewer::new().show(ui, &mut CommonMarkCache::default(), payload.raw_content.as_str());
+
+                            ui.add_space(30.0);
+                        });
+                    }
+                }
+            );
 
         egui::CentralPanel::default().show_inside(ui, |ui| {
             type L =
@@ -170,6 +201,12 @@ impl App for BasicApp {
 
             let selected_nodes: Vec<_> = self.g.selected_nodes().iter().copied().collect();
             let all_nodes: Vec<_> = self.g.nodes_iter().map(|(idx, _)| idx).collect();
+
+            if selected_nodes.len() == 0 {
+                let mut sel_node = self.selected_node.write().unwrap();
+
+                *sel_node = None;
+            }
 
             //reset prev selected nodes
             for idx in all_nodes {
@@ -198,21 +235,11 @@ impl App for BasicApp {
 
                 let default_win_pos: Pos2 = Pos2 { x: 0.0, y: 0.0 };
 
-                egui::Window::new(node.label())
-                    .default_pos(default_win_pos)
-                    .scroll([false, true])
-                    .show(&ctx, |ui| {
-                        let payload = node.payload().clone();
+                let payload = node.payload().clone();
 
-                        ui.label(payload.filename);
-                        ui.label(&format!(
-                            "Word Count: {word_count}",
-                            word_count = payload.word_count
-                        ));
+                let mut new_node = self.selected_node.write().unwrap();
 
-                        let mut cache = CommonMarkCache::default();
-                        CommonMarkViewer::new().show(ui, &mut cache, payload.raw_content.as_str());
-                    });
+                *new_node = Some(node.clone());
             }
 
             let selected_edges = Vec::from(self.g.selected_edges());
@@ -246,8 +273,9 @@ impl App for BasicApp {
                 .with_styles(&settings_style)
                 .with_navigations(&settings_navigation)
                 .with_interactions(&settings_interaction);
-
+                
             ui.add(&mut view);
+
         });
     }
 }
